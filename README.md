@@ -1,6 +1,6 @@
 # 🧊 Autonomous Thermal Controller
 
-**Live demo:** https://callen-cox.github.io/solute-cooling/ (runs right in your browser, nothing to install)
+**Live demo:** https://24emirmendez-del.github.io/solute-cooling/ (runs right in your browser, nothing to install)
 
 Cooling for small data centers that have **no room for a radiator**: an office building's server closet, a cramped site in a developing region, or a relay in orbit. The controller treats the coolant as a finite thermal sink and manages it autonomously. A deterministic **safety supervisor** sits above every optimisation mode and can always overrule it.
 
