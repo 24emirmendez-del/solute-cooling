@@ -417,7 +417,7 @@ class Ground(Sim):
                     tile("Saturation", f"{sat:.0%}", sat * 100,
                          f"reserve swap at 85% · reserve tanks {self.tanks} · pump load ×{1 + 2 * sat:.2f}"),
                     tile("Heat released to room", f"{self.released_w:.0f} W", None,
-                         "thermal signature (stealth holds it near 0)")]
+                         "heat escaping into the room (stealth mode keeps this near 0)")]
         avg = sum(self.melt) / self.MODULES
         mods = " · ".join(f"M{k + 1} {m:.0%}{'◀' if k == self.engaged else ''}" for k, m in enumerate(self.melt))
         fan = "fan on" if self.cmd.get("fan", True) else "insulated (stealth)"
@@ -425,7 +425,7 @@ class Ground(Sim):
                 tile("Regeneration", "low-power" if info["regen"] else "normal", None,
                      f"idle modules: {fan}"),
                 tile("Heat released to room", f"{self.released_w:.0f} W", None,
-                     "loop + modules re-solidifying (thermal signature)")]
+                     "heat escaping from the loop and from modules as they re-solidify")]
 
     def scenarios(self):
         s = [("spike", "⚡ Sustained load"), ("burst", "📅 Scheduled job"), ("window", "🪟 Safe window"),
