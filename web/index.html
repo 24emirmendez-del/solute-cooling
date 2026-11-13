@@ -87,14 +87,16 @@ table{border-collapse:collapse;width:100%;font-size:14px}td,th{border-bottom:1px
    At 85% it swaps to a reserve tank. With no reserve it stops dosing before crystals clog the cold plates.</td></tr>
   <tr><td><b>PCM</b><br>terrestrial</td><td>Sodium thiosulfate pentahydrate melts at 48.3 °C and absorbs about 200 kJ/kg doing it, then re-solidifies to be reused.</td>
    <td>Runs one module at a time and swaps when it is spent. When the modules are half spent it schedules a low-power state so idle ones re-solidify.</td></tr>
-  <tr><td><b>Radiators</b><br>orbital</td><td>No air in space, so heat only leaves as radiation: Q = εσAT⁴. Sunlight adds αSA·cos θ.</td>
-   <td>Keeps the radiators edge-on to the sun. If they absorb more than they emit (stuck facing the sun), it retracts them behind the MLI shield.
-   A freeze guard (heater, sun-facing, retraction) keeps the water above 5 °C.</td></tr></table></div>
+  <tr><td><b>Radiators</b><br>orbital</td><td>No air in space, so heat only leaves as radiation: Q = εσAT⁴. Sunlight adds αSA·cos θ, and Earth adds its own infrared glow and reflected sunlight.
+   The simulated relay is in a 90-minute low Earth orbit with a 35-minute eclipse each lap, and the sun sweeps all the way around it once per orbit.</td>
+   <td>Feeds forward the heat balance (server power + absorbed heat vs. what the radiators emit), so eclipse entry and exit are handled at once.
+   Keeps the radiators edge-on as the sun moves. If they absorb more than they emit (stuck facing the sun), it retracts them behind the MLI shield.
+   A freeze guard (heater, sun-facing, retraction) keeps the water above 5 °C. Radiation bit flips are filtered out of the sensor readings, and the safety thresholds are kept in three copies that are majority-voted every step.</td></tr></table></div>
 
  <div class="card"><h3>Modes</h3><table>
   <tr><th>Mode</th><th>Goal</th><th>Salt</th><th>PCM</th><th>Orbit</th></tr>
-  <tr><td><b>Efficiency</b></td><td>Save consumables and wear</td><td>Floats up to 40 °C, letting the room carry some heat</td><td>Schedules regeneration</td><td>Floats near 28 °C, slews only when needed</td></tr>
-  <tr><td><b>Performance</b></td><td>Coolest chips</td><td>Holds 25 °C and pre-cools before scheduled jobs</td><td>Never caps load for regeneration</td><td>Radiators out, holds about 20 °C</td></tr>
+  <tr><td><b>Efficiency</b></td><td>Save consumables and wear</td><td>Floats up to 40 °C, letting the room carry some heat</td><td>Schedules regeneration</td><td>Holds 30 °C, lets the attitude float in eclipse</td></tr>
+  <tr><td><b>Performance</b></td><td>Coolest chips</td><td>Holds 25 °C and pre-cools before scheduled jobs</td><td>Never caps load for regeneration</td><td>Radiators out, as cold as they allow (about 26 °C)</td></tr>
   <tr><td><b>Stealth</b></td><td>Minimal thermal signature</td><td>Holds room temperature, so almost no heat leaks out</td><td>Idle modules stay insulated</td><td>Stores heat in the water, radiates in a safe window</td></tr></table></div>
 
  <div class="card"><h3>Where it runs</h3><ul>
@@ -206,11 +208,13 @@ const DEMO = {
     ['Load back to normal. Stealth mode: idle modules stay insulated, so they keep their heat instead of releasing it. Watch "Heat released to room" drop.', '-spike mode=stealth', 10],
     ['A safe window opens: the fans come on and the modules dump their stored heat into the room.', '+window', 8]],
   orbit: [
-    ['In orbit heat leaves only as radiation (Q = εσAT⁴). The radiators stay edge-on to the sun; efficiency mode floats near 28 °C.', 'reset mode=efficiency speed=1', 8],
-    ['Performance mode: radiators fully out, and the water drops toward 20 °C.', 'mode=performance', 10],
+    ['In orbit heat leaves only as radiation (Q = εσAT⁴). The radiators stay edge-on to the sun; efficiency mode holds 30 °C.', 'reset mode=efficiency speed=1', 8],
+    ['Every 90 minutes the relay passes through Earth\'s shadow (20× speed). The controller balances the heat budget, so the temperature barely moves through eclipse.', 'speed=20', 14],
+    ['Performance mode: radiators fully out, and the water drops as low as they allow.', 'mode=performance speed=1', 10],
     ['Servers go idle (5× speed). Without their waste heat the water would freeze, so the guard retracts the radiators, turns to the sun and runs a heater.', '+idle speed=5', 14],
     ['Servers resume, and the radiators come back out.', '-idle speed=1', 8],
-    ['Close solar pass: sunlight ×3. Staying edge-on means the radiators absorb almost none of it.', '+solar_pass', 8],
+    ['Radiation storm: random bit flips hit the sensors and the controller\'s memory. Impossible readings are thrown out and the safety thresholds are repaired from redundant copies (see the event log).', '+radiation speed=5', 12],
+    ['Close solar pass: sunlight ×3. Staying edge-on means the radiators absorb almost none of it.', '-radiation +solar_pass +high_beta speed=1', 8],
     ['ADCS fails, stuck facing the sun. The radiators now absorb more than they emit, so it hides them behind the MLI shield, then sheds load and shuts down safely.', '+adcs_fault', 16]]
 };
 async function doActions(text) {

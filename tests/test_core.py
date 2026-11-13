@@ -1,7 +1,9 @@
+import random
+
 import pytest
 from fastapi.testclient import TestClient
 
-from coolant.core import MODES, Config, Controller, Engine, State, solubility
+from coolant.core import MODES, Config, Controller, Engine, Orbit, State, solubility
 from coolant.server import app
 
 
@@ -117,6 +119,7 @@ def test_losing_all_sensors_fails_safe(kw):
 @pytest.mark.parametrize("mode", ["efficiency", "performance"])
 def test_throttle_does_not_flicker(mode):
     e = Engine(env="orbital", mode=mode)
+    e.scenario("high_beta")             # no eclipse to cool it back down mid-test
     run(e, 300)
     e.scenario("solar_pass")
     e.scenario("adcs_fault")
@@ -171,6 +174,63 @@ def test_orbit_stealth_holds_heat_until_the_window():
     e.scenario("window")
     run(e, 250)
     assert e.last["true_T"] < 33
+
+
+@pytest.mark.parametrize("mode,lo,hi", [("efficiency", 28, 32), ("performance", 24, 29), ("stealth", 43, 48)])
+def test_orbit_holds_temperature_through_eclipses(mode, lo, hi):
+    e = Engine(env="orbital", mode=mode)
+    run(e, 200)
+    seen = set()
+    for _ in range(5 * 270):                     # five 90-minute orbits
+        e.step()
+        seen.add(e.hal.sunlit())
+        assert e.last["state"] == "NORMAL" and lo < e.last["true_T"] < hi
+    assert seen == {True, False}
+
+
+def test_orbit_tracks_the_sun_as_it_moves():
+    e = Engine(env="orbital", mode="performance")
+    for _ in range(3 * 270):
+        e.step()
+        if e.hal.sunlit():
+            assert abs(e.hal.theta) > 80        # kept edge-on while the sun sweeps around
+    eff = Engine(env="orbital")
+    run(eff, 3 * 270)
+    assert eff.hal.slewed < e.hal.slewed / 2  # efficiency lets the attitude float in eclipse
+
+
+def test_orbit_eclipse_and_earth_heat_are_modelled():
+    o = Orbit()
+    o.theta = 90.0
+    day = o.absorb_full()
+    o.clock = o.PERIOD - 60                      # in Earth's shadow
+    assert not o.sunlit() and 0 < o.absorb_full() < day   # only Earth's infrared glow remains
+    o.flags["high_beta"] = True
+    assert o.sunlit() and o.next_transition_s() is None
+
+
+@pytest.mark.parametrize("seed", range(5))
+def test_radiation_storm_is_shrugged_off(seed):
+    random.seed(seed)
+    e = Engine(env="orbital")
+    run(e, 100)
+    e.scenario("radiation")
+    states = set()
+    for _ in range(2700):
+        e.step()
+        states.add(e.last["state"])
+    assert states <= {"NORMAL", "WARNING"}
+    assert logged(e, "memory scrub") and e.cfg == Config()
+
+
+def test_memory_scrub_repairs_a_corrupted_threshold():
+    e = Engine(env="orbital")
+    e.ctl.cfg.t_shutdown = 999.0                 # a bit flip disables the shutdown limit
+    e.step()
+    assert e.cfg.t_shutdown == 60.0 and logged(e, "repaired corrupted t_shutdown")
+    e.update_config({"t_shutdown": 62.0})        # deliberate changes are kept
+    e.step()
+    assert e.cfg.t_shutdown == 62.0
 
 
 # ---------- engine + API ----------

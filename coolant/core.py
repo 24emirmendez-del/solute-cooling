@@ -72,6 +72,7 @@ class Config:
     min_hopper_g: float = 1500.0   # salt: warn when the solute hopper drops below this
     max_dose: float = 25.0         # salt: dosing pump limit, g/s
     max_sensor_gap: float = 3.0    # sensors further apart than this get voted on
+    max_rate: float = 0.05         # C/s the coolant can't physically exceed: faster readings are glitches
     lookahead_s: float = 60.0      # prediction horizon (x10 in orbit, where things move slower)
 
     def validate(self):
@@ -87,31 +88,71 @@ class Controller:
     """The brain. Hardware-agnostic: an observation dict goes in, a command dict comes out."""
 
     def __init__(self, cfg, mode="efficiency"):
-        self.cfg, self.mode = cfg, mode
+        self.mode = mode
+        self.set_config(cfg)
         self.reset()
+
+    def set_config(self, cfg):
+        """Keep three copies of the safety thresholds (triple modular redundancy)."""
+        self.cfg = cfg
+        self.copies = [asdict(cfg) for _ in range(3)]
+
+    def scrub(self, notes):
+        """Radiation can flip bits in memory. Majority-vote every threshold across the live config and
+        its three copies each step, and repair whichever one disagrees."""
+        live = asdict(self.cfg)
+        for k in live:
+            votes = [live[k]] + [c[k] for c in self.copies]
+            good = max(set(votes), key=votes.count)
+            if votes.count(good) < 3:       # no clear majority: fall back to the factory default
+                good = getattr(Config(), k)
+            if live[k] != good:
+                setattr(self.cfg, k, good)
+                notes.append(f"memory scrub: repaired corrupted {k}")
+            for c in self.copies:
+                c[k] = good
 
     def reset(self):
         self.integ = self.slope = self.last_dose = self.clock = self.throttle_until = 0.0
+        self.bad_steps = self.solo_steps = 0
         self.prev = self.module = self.last_module = None
         self.eff = 1.0                      # learned dosing-pump effectiveness
         self.regen = self.cold = self.hide = False
         self.state, self.reason = State.NORMAL, "ok"
 
     # ---------- 1. sense ----------
-    def fuse(self, readings):
+    def fuse(self, readings, dt=1.0):
         """Median vote -> (temperature, health). health: 0 ok, 1 degraded, 2 no usable data."""
         c = self.cfg
         good = sorted(r for r in readings if r is not None and -40 < r < 150)
+        solo = False
+        if self.prev is not None:
+            # The coolant can't physically move max_jump in one step, so such a reading is a glitch
+            # (e.g. a radiation bit flip), even if two sensors are hit at once.
+            jump = max(0.5, c.max_rate * dt)
+            plausible = [r for r in good if abs(r - self.prev) <= jump]
+            if not plausible and good and self.solo_steps < 1:
+                self.solo_steps += 1            # every reading hit at once: hold the last trusted value
+                return self.prev, 0
+            if len(plausible) == 1 and len(good) > 1 and self.solo_steps < 5:
+                good, solo = plausible, True    # briefly trust the one that agrees with recent history
+            elif plausible:
+                good = plausible
+        self.solo_steps = self.solo_steps + 1 if solo else 0
+        if solo:
+            self.bad_steps += 1
+            return good[0], (1 if self.bad_steps >= 5 else 0)
         if len(good) < 2:
             return (good[-1] if good else c.t_shutdown + 1), 2   # can't vote: assume the worst
-        health = 1 if len(good) < len(readings) else 0
         if good[-1] - good[0] > c.max_sensor_gap:
             med = good[len(good) // 2]
             kept = [g for g in good if abs(g - med) <= c.max_sensor_gap]
             if len(kept) < 2:
                 return good[-1], 2
-            good, health = kept, 1
-        return sum(good) / len(good), health
+            good = kept
+        # One-off glitches are outvoted silently; a sensor that stays bad is flagged for maintenance.
+        self.bad_steps = self.bad_steps + 1 if len(good) < len(readings) else 0
+        return sum(good) / len(good), (1 if self.bad_steps >= 5 else 0)
 
     def setpoint(self, o):
         kind = o["kind"]
@@ -218,6 +259,7 @@ class Controller:
     def act_orbit(self, o, T, Tp, sp, hot, health, notes):
         c = self.cfg
         theta, dep = o["theta"], o["dep"]
+        edge_on = 90.0 if theta >= 0 else -90.0   # nearest attitude with no sunlight on the radiator face
         if health == 2:
             # Blind with the servers off: retract to slow every temperature change, hold attitude,
             # and hand freeze protection to the survival heater's hardware thermostat.
@@ -232,14 +274,24 @@ class Controller:
             notes.append("radiators absorb more than they emit: retracting behind MLI" if hide
                          else "radiators emit more than they absorb: redeploying")
         self.hide = hide
-        if Tp > sp or self.mode == "performance":
-            theta = 90.0                    # edge-on to the sun (efficiency only slews when needed)
+        # The sun sweeps around the craft every orbit. Efficiency lets the attitude float (None) in
+        # eclipse and while the sun stays near-grazing, saving reaction-wheel wear; otherwise it
+        # slews back to edge-on.
+        grazing = not o.get("sunlit", True) or math.cos(math.radians(theta)) < 0.26
+        theta = None if self.mode == "efficiency" and grazing and Tp <= sp + 2 else edge_on
+        # Feedforward: the deployment that exactly balances the heat coming in (servers + absorbed)
+        # against what the radiators emit. Eclipse entry/exit changes absorb_w, so this reacts at once.
+        if net > 1.0:
+            ff = min(1.0, max(0.0, (o["load_w"] / net - 0.05) / 0.95))
+        else:
+            ff = 1.0
         if self.mode == "performance":      # as cold as possible, but no colder than the setpoint
-            dep = min(1.0, max(0.05, 1.0 - 0.25 * (sp - Tp)))
+            dep = ff + 0.25 * (Tp - sp)
         elif self.mode == "stealth" and not o.get("window"):
-            dep = 0.05 if Tp < sp else min(1.0, 0.05 + 0.25 * (Tp - sp + 1))
+            dep = 0.05 if Tp < sp else ff + 0.25 * (Tp - sp + 1)
         else:                               # efficiency: float in a wide band
-            dep = min(1.0, max(0.05, 1.0 - 0.1 * (sp - Tp)))
+            dep = ff + 0.1 * (Tp - sp)
+        dep = min(1.0, max(0.05, dep))
         if hot >= c.t_warn:
             dep = 1.0
         if hide:
@@ -247,8 +299,10 @@ class Controller:
         return {"theta": theta, "dep": dep, "heater": 0.0, "survival": False}
 
     def step(self, o, dt):
+        notes = []
+        self.scrub(notes)
         c, kind = self.cfg, o["kind"]
-        T, health = self.fuse(o["temps"])
+        T, health = self.fuse(o["temps"], dt)
         if health == 2:                     # blind: freeze the predictor, restart it when data returns
             self.prev, self.slope = None, 0.0
         elif self.prev is not None:
@@ -258,7 +312,6 @@ class Controller:
         Tp = T + self.slope * c.lookahead_s * (10 if kind == "orbit" else 1)
         hot, sp = max(T, Tp), self.setpoint(o)
         sat, low, out = self.reserve(o, T, sp)
-        notes = []
         if kind == "orbit" and health < 2:
             low_t = min(T, Tp)
             cold = low_t < c.t_freeze_warn or (self.cold and low_t < c.t_freeze_warn + 8)
@@ -436,25 +489,55 @@ class Ground(Sim):
 
 
 class Orbit(Sim):
-    """Orbital relay: heat leaves only by radiation, Q = eps*sigma*A*T^4."""
+    """Relay in low Earth orbit: heat leaves only by radiation, Q = eps*sigma*A*T^4.
+
+    Models a ~400 km orbit: 90-minute period with a 35-minute eclipse, the sun's apparent motion
+    (the craft points at Earth, so the sun sweeps around it once per orbit and the ADCS has to keep
+    slewing to stay edge-on), Earth's infrared glow and reflected sunlight (albedo).
+    """
     kind = "orbit"
     BASE_W, AREA, EPS, ALPHA, SUN, WATER_KG = 500.0, 1.5, 0.85, 0.15, 1361.0, 4.0
+    PERIOD, ECLIPSE = 5400.0, 2100.0           # s; ~400 km, sun in the orbit plane (beta = 0)
+    EARTH_IR, ALBEDO, VIEW = 237.0, 0.30, 0.25  # W/m2, fraction reflected, radiator's view factor to Earth
+    SEU_RATE = 0.05                            # radiation storm: chance per sensor reading of a bit flip
 
     def __init__(self):
         self.reset()
 
     def reset(self):
-        self.T, self.theta, self.dep, self.heater, self.slewed = 25.0, 90.0, 1.0, 0.0, 0.0
+        self.T, self.theta, self.dep, self.heater, self.slewed, self.clock = 25.0, 90.0, 1.0, 0.0, 0.0, 0.0
         self.cmd = {"load": 1.0, "theta": 90.0, "dep": 1.0, "heater": 0.0}
-        self.flags = {"solar_pass": False, "adcs_fault": False, "idle": False, "window": False,
-                      "sensor_fault": False, "sensors_lost": False}
+        self.flags = {"solar_pass": False, "high_beta": False, "adcs_fault": False, "idle": False,
+                      "window": False, "radiation": False, "sensor_fault": False, "sensors_lost": False}
+
+    # ---------- orbit geometry ----------
+    def phase(self):
+        return (self.clock % self.PERIOD) / self.PERIOD
+
+    def sunlit(self):
+        """High beta angle: the orbit plane faces the sun and the craft never enters Earth's shadow."""
+        return self.flags["high_beta"] or self.phase() < 1.0 - self.ECLIPSE / self.PERIOD
+
+    def next_transition_s(self):
+        if self.flags["high_beta"]:
+            return None
+        t, day = self.clock % self.PERIOD, self.PERIOD - self.ECLIPSE
+        return day - t if t < day else self.PERIOD - t
 
     def exposure(self):
         return 0.05 + 0.95 * self.dep          # fully retracted = 5% still exposed behind the MLI shield
 
-    def absorb_full(self):                     # sunlight absorbed by a fully deployed radiator
+    def absorb_full(self):
+        """Heat a fully deployed radiator picks up: sunlight + Earth's infrared + reflected sunlight."""
+        earth_ir = self.EPS * self.EARTH_IR * self.VIEW * self.AREA      # IR absorptivity = emissivity
+        if not self.sunlit():
+            return earth_ir
         sun = self.SUN * (3.0 if self.flags["solar_pass"] else 1.0)
-        return self.ALPHA * sun * self.AREA * max(0.0, math.cos(math.radians(self.theta)))
+        direct = self.ALPHA * sun * self.AREA * max(0.0, math.cos(math.radians(self.theta)))
+        day = self.PERIOD - self.ECLIPSE
+        noon = 0.0 if self.flags["high_beta"] else math.cos(math.pi * ((self.clock % self.PERIOD) / day - 0.5))
+        albedo = self.ALPHA * sun * self.ALBEDO * self.VIEW * self.AREA * max(0.0, noon) * (0.3 if self.flags["high_beta"] else 1.0)
+        return direct + albedo + earth_ir
 
     def emit_full(self):                       # what a fully deployed radiator would emit
         return self.EPS * SIGMA * self.AREA * (self.T + 273.15) ** 4
@@ -463,38 +546,57 @@ class Orbit(Sim):
     def load_w(self):
         return self.BASE_W * (0.05 if self.flags["idle"] else 1.0) * self.cmd["load"]
 
+    def temps(self):
+        t = super().temps()
+        if self.flags["radiation"]:            # single-event upsets: random bit flips in sensor readings
+            t = [random.uniform(-60, 200) if x is not None and random.random() < self.SEU_RATE else x for x in t]
+        return t
+
     def read(self):
         return {"kind": "orbit", "temps": self.temps(), "load_w": self.load_w, "demand_w": self.BASE_W,
                 "forecast_w": self.BASE_W, "theta": self.theta, "dep": self.dep,
-                "absorb_w": self.absorb_full(), "emit_w": self.emit_full(),
+                "absorb_w": self.absorb_full(), "emit_w": self.emit_full(), "sunlit": self.sunlit(),
+                "transition_s": self.next_transition_s(),
                 "window": self.flags["window"], "adcs_ok": not self.flags["adcs_fault"]}
 
     def tick(self, dt):
         c = self.cmd
+        # Pointing at Earth, the sun sweeps 360 degrees around the craft every orbit.
+        drift = 360.0 * dt / self.PERIOD
         if self.flags["adcs_fault"]:
             self.theta = 20.0                  # stuck facing the sun
+        elif c["theta"] is None:               # attitude left to float: no reaction-wheel effort
+            self.theta = ((self.theta + drift + 180.0) % 360.0) - 180.0
         else:
-            turn = max(-dt, min(dt, c["theta"] - self.theta))   # slews at 1 deg/s
-            self.theta += turn
+            want = ((c["theta"] - (self.theta + drift) + 180.0) % 360.0) - 180.0
+            turn = max(-dt, min(dt, want))     # reaction wheels slew at 1 deg/s
+            self.theta = ((self.theta + drift + turn + 180.0) % 360.0) - 180.0
             self.slewed += abs(turn)
         self.dep += max(-0.02 * dt, min(0.02 * dt, c["dep"] - self.dep))
         survival = 60.0 if c.get("survival") and self.T < 10.0 else 0.0   # hardware thermostat, no software
         self.heater = c["heater"] + survival
         q = self.load_w + self.heater + (self.absorb_full() - self.emit_full()) * self.exposure()
         self.T += q * dt / (self.WATER_KG * CP_WATER)
+        self.clock += dt
 
     def tiles(self, info):
         f = self.exposure()
         stuck = " · ADCS FAULT" if self.flags["adcs_fault"] else ""
-        return [tile("Radiators deployed", f"{self.dep:.0%}", self.dep * 100, "retracted = behind the MLI shield"),
+        nxt = self.next_transition_s()
+        where = "☀ Sunlit" if self.sunlit() else "🌑 Eclipse"
+        sub = ("high beta angle: no eclipse" if nxt is None
+               else f"{'eclipse' if self.sunlit() else 'sunrise'} in {nxt / 60:.0f} min · orbit {self.phase():.0%}")
+        return [tile("Orbit", where, self.phase() * 100, sub),
+                tile("Radiators deployed", f"{self.dep:.0%}", self.dep * 100, "retracted = behind the MLI shield"),
                 tile("Attitude to sun", f"{self.theta:.0f}°", None,
-                     f"90° = edge-on · slewed {self.slewed:.0f}° total{stuck}"),
+                     f"±90° = edge-on · slewed {self.slewed:.0f}° total{stuck}"),
                 tile("Radiated to space", f"{self.emit_full() * f:.0f} W", None,
-                     f"sunlight absorbed {self.absorb_full() * f:.0f} W · heater {self.heater:.0f} W")]
+                     f"absorbed (sun, Earth IR, albedo) {self.absorb_full() * f:.0f} W · heater {self.heater:.0f} W")]
 
     def scenarios(self):
-        return [("solar_pass", "☀ Close solar pass"), ("adcs_fault", "🛰 ADCS fault"), ("idle", "❄ Servers idle"),
-                ("window", "🪟 Safe window"), ("sensor_fault", "🌡 1 sensor fails"),
+        return [("solar_pass", "☀ Close solar pass"), ("high_beta", "🌞 No eclipse (high β)"),
+                ("adcs_fault", "🛰 ADCS fault"), ("idle", "❄ Servers idle"), ("window", "🪟 Safe window"),
+                ("radiation", "☢ Radiation storm"), ("sensor_fault", "🌡 1 sensor fails"),
                 ("sensors_lost", "🚫 All sensors lost"), ("reset", "↺ Reset")]
 
 
@@ -545,6 +647,9 @@ class Engine:
     def step(self):
         with self.lock:
             h = self.hal
+            if h.flags.get("radiation") and random.random() < 0.02:   # a bit flip in the controller's RAM
+                k = random.choice([f.name for f in fields(Config)])
+                setattr(self.ctl.cfg, k, getattr(self.ctl.cfg, k) * random.choice((0.0, 4.0, -1.0)))
             cmd, info = self.ctl.step(h.read(), self.dt)
             if info["state"] != self.prev_state:
                 self.log(f'{info["state"]}: {info["reason"]}')
@@ -588,7 +693,8 @@ class Engine:
             if not set(patch) <= known:
                 raise ValueError(f"unknown keys: {sorted(set(patch) - known)}")
             new = Config(**{**asdict(self.cfg), **{k: float(v) for k, v in patch.items()}}).validate()
-            self.cfg = self.ctl.cfg = new
+            self.cfg = new
+            self.ctl.set_config(new)
             self.log("config updated")
             return asdict(new)
 
